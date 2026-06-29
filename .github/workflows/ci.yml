@@ -1,0 +1,30 @@
+name: Continuous Integration
+
+on:
+  push: { branches: [main], tags: ["*"] }
+  pull_request:
+  schedule: [{ cron: '30 2 * * 1,4' }]  # Every Monday and Thursday @ 2h30am UTC
+
+jobs:
+  test:
+    uses: ratt-ru/rarg-gh-workflows/.github/workflows/python-ci.yml@main
+    with:
+      os-matrix: '["ubuntu-24.04"]'  # Add other OS (macos-15) if necessary
+      install-command: 'pip install --group test .'
+
+  deploy:
+    needs: ["test"]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/rarg-ray-patterns
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-python@v6
+        with: { python-version: '3.13' }
+      - uses: actions/checkout@v6
+      - run: pip install -U pip build && python -m build --sdist --wheel
+      - name: Publish distribution 📦 to PyPI
+        if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
+        uses: pypa/gh-action-pypi-publish@release/v1
