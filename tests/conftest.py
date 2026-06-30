@@ -13,7 +13,7 @@ GITHUB_CONFIG_PATH = "python/ray/autoscaler/_private/fake_multi_node/example.yam
 LOCAL_CONFIG_PATH = "autoscaler/_private/fake_multi_node/example.yaml"
 
 
-@pytest.fixture(scope="session", autouse=True)  # type: ignore[misc]  # untyped pytest decorator
+@pytest.fixture(scope="session", autouse=True)
 def install_example_yaml() -> None:
   """Install the example config needed by AutoscalingCluster.
 

@@ -20,13 +20,13 @@ class MonitorActor:
     await asyncio.Event().wait()
 
 
-@ray.remote  # type: ignore[misc]
+@ray.remote
 def keep_alive(timeout: float) -> None:
   """Sleep for timeout in order to keep the worker (and node) alive"""
   time.sleep(timeout)
 
 
-@ray.remote(num_cpus=0, num_returns=2)  # type: ignore[misc]
+@ray.remote(num_cpus=0, num_returns=2)
 def discover_node() -> tuple[Any, Any]:
   """Return this node's id and a keep-alive ref pinned to the same node.
 
@@ -52,9 +52,11 @@ class ActorAutoscaler:
     # Resolved lazily on first autoscale(); cached because the head node id is
     # stable for the cluster's lifetime. _UNSET until looked up.
     self._head_node_id: Any = _UNSET
-    self._workers: dict[str, ray.actor.ActorHandle] = {}
+    self._workers: dict[str, ray.actor.ActorHandle[Any]] = {}
     # node-id future -> (node-id ObjectRef, keepalive ObjectRef)
-    self._pending: dict[asyncio.Future[Any], tuple[ray.ObjectRef, ray.ObjectRef]] = {}
+    self._pending: dict[
+      asyncio.Future[Any], tuple[ray.ObjectRef[Any], ray.ObjectRef[Any]]
+    ] = {}
     # heartbeat futures held to keep them from being GC'd
     self._heartbeats: set[asyncio.Future[Any]] = set()
     self._closed: bool = False
@@ -92,7 +94,7 @@ class ActorAutoscaler:
       self._head_node_id = next(
         (
           n["NodeID"]
-          for n in ray.nodes()
+          for n in ray.nodes()  # type: ignore[no-untyped-call]
           if n.get("Alive") and "node:__internal_head__" in n.get("Resources", {})
         ),
         None,
@@ -137,7 +139,9 @@ class ActorAutoscaler:
 
     print(f"Requesting {requested} nodes")
     for _ in range(requested):
-      node_ref, keepalive_ref = discover_node.options(**options).remote()
+      # num_returns=2 makes .remote() yield a 2-tuple of ObjectRefs, but the
+      # type stubs only describe the single-return case.
+      node_ref, keepalive_ref = discover_node.options(**options).remote()  # type: ignore[misc]
       future = wrap_future(node_ref)
       self._pending[future] = (node_ref, keepalive_ref)
 

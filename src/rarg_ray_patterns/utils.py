@@ -7,6 +7,6 @@ if TYPE_CHECKING:
   import ray
 
 
-def wrap_future(obj_ref: ray.ObjectRef) -> asyncio.Future[Any]:
+def wrap_future(obj_ref: ray.ObjectRef[Any]) -> asyncio.Future[Any]:
   """Wrap a ray ObjectReference as an asyncio Future"""
   return asyncio.wrap_future(obj_ref.future())

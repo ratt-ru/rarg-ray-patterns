@@ -55,7 +55,7 @@ class Scheduler:
   async def run(self) -> None:
     try:
       while not self._event.is_set():
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(1.0)
         await self._autoscaler.autoscale()
     finally:
       await self._autoscaler.close()
@@ -83,7 +83,7 @@ def _head_node_id() -> str:
     str,
     next(
       n["NodeID"]
-      for n in ray.nodes()
+      for n in ray.nodes()  # type: ignore[no-untyped-call]
       if n.get("Alive") and "node:__internal_head__" in n.get("Resources", {})
     ),
   )
@@ -94,7 +94,8 @@ def _head_node_id() -> str:
 # nworkers=100 case exercises convergence to the cluster's node capacity; it is
 # slow, so we run it once with the default (head excluded) rather than for both
 # flag values, since the flag behaviour is already covered by the nworkers=8 pair.
-@pytest.mark.parametrize(  # type: ignore[misc]  # untyped pytest decorator
+@pytest.mark.filterwarnings("ignore::FutureWarning")
+@pytest.mark.parametrize(
   "nworkers, batch_size, install_on_head", [(8, 5, False), (8, 5, True), (20, 5, False)]
 )
 def test_actor_autoscaling(
@@ -108,7 +109,8 @@ def test_actor_autoscaling(
   cfg = typing.cast(dict[str, typing.Any], copy.deepcopy(AUTOSCALING_CLUSTER_CONFIG))
   cfg["worker_node_types"]["cpu_node"]["max_workers"] = schedulable
   cfg["max_workers"] = schedulable * 5
-  cluster = AutoscalingCluster(**cfg)
+  with pytest.warns(ResourceWarning, match="unclosed file"):
+    cluster = AutoscalingCluster(**cfg)
 
   try:
     cluster.start()
@@ -158,4 +160,4 @@ def test_actor_autoscaling(
     ray.get(run_future)
   finally:
     ray.shutdown()
-    cluster.shutdown()
+    cluster.shutdown()  # type: ignore[no-untyped-call]
