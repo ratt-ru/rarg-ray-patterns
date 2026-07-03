@@ -2,12 +2,13 @@ import asyncio
 import copy
 import time
 import typing
+from collections import Counter
 
 import pytest
 import ray
 from ray.cluster_utils import AutoscalingCluster
-from ray.util.state import list_actors
-from ray.util.state.common import ActorState
+from ray.util.state import list_actors, list_nodes
+from ray.util.state.common import ActorState, NodeState
 
 from rarg_ray_patterns.autoscaling import ActorAutoscaler
 
@@ -47,9 +48,15 @@ AUTOSCALING_CLUSTER_CONFIG = {
 @ray.remote
 class Scheduler:
   def __init__(
-    self, nworkers: int = 10, batch_size: int = 2, install_on_head: bool = False
+    self,
+    nworkers: int = 10,
+    batch_size: int = 2,
+    install_on_head: bool = False,
+    label_selector: dict[str, str] | None = None,
   ):
-    self._autoscaler = ActorAutoscaler(nworkers, batch_size, install_on_head)
+    self._autoscaler = ActorAutoscaler(
+      nworkers, batch_size, install_on_head, label_selector
+    )
     self._target = nworkers
     self._event = asyncio.Event()
 
@@ -176,6 +183,114 @@ def test_actor_autoscaling(
     ray.get(scheduler.stop.remote())
     # Surface any error from the run loop.
     ray.get(run_future)
+  finally:
+    ray.shutdown()
+    cluster.shutdown()  # type: ignore[no-untyped-call]
+
+
+def test_label_selector_reserved_key() -> None:
+  """The node-id label is reserved for the autoscaler's exclusion/pinning."""
+  with pytest.raises(ValueError, match="ray.io/node-id"):
+    ActorAutoscaler(label_selector={"ray.io/node-id": "some-node-id"})
+
+
+# The label key constraining which node class an autoscaler manages, and how
+# many nodes of each class the labelled cluster may provision.
+NODE_CLASS_LABEL = "rarg.io/node-class"
+CLASS_WORKERS = 3
+
+LABELLED_CLUSTER_CONFIG = {
+  "head_resources": {"CPU": 0},
+  "worker_node_types": {
+    "compute_node": {
+      "resources": {
+        "CPU": 1,
+        "object_store_memory": 100 * 1024 * 1024,
+      },
+      "labels": {NODE_CLASS_LABEL: "compute"},
+      "node_config": {},
+      "min_workers": 0,
+      "max_workers": CLASS_WORKERS,
+    },
+    "io_node": {
+      "resources": {
+        "CPU": 1,
+        "object_store_memory": 100 * 1024 * 1024,
+      },
+      "labels": {NODE_CLASS_LABEL: "io"},
+      "node_config": {},
+      "min_workers": 0,
+      "max_workers": CLASS_WORKERS,
+    },
+  },
+  "min_workers": 0,
+  "max_workers": CLASS_WORKERS * 2 * 5,
+  "autoscaler_v2": True,
+}
+
+
+def _monitor_class_counts(monitors: list[ActorState]) -> Counter[str | None]:
+  """Count monitors by the node class label of the node each is pinned to."""
+  # list_nodes is typed as returning Any; pin the element type here.
+  nodes: list[NodeState] = list_nodes(detail=True)
+  node_labels = {n.node_id: n.labels or {} for n in nodes}
+  # A monitor with no (or an unknown) node id counts under class None, which
+  # any exact per-class assertion then reports loudly.
+  return Counter(
+    node_labels.get(m.node_id or "", {}).get(NODE_CLASS_LABEL) for m in monitors
+  )
+
+
+# One cluster spin-up with two labelled node classes and one autoscaler per
+# class: each must converge on its own class and never claim the other's
+# nodes, which also proves selector-partitioned autoscalers can coexist.
+@pytest.mark.filterwarnings("ignore::FutureWarning")
+def test_actor_autoscaling_label_selectors() -> None:
+  batch_size = 2
+  node_classes = ("compute", "io")
+  expected = CLASS_WORKERS * len(node_classes)
+
+  cfg = typing.cast(dict[str, typing.Any], copy.deepcopy(LABELLED_CLUSTER_CONFIG))
+  with pytest.warns(ResourceWarning, match="unclosed file"):
+    cluster = AutoscalingCluster(**cfg)
+
+  try:
+    cluster.start()
+    ray.init("auto", runtime_env={"excludes": ".*"})
+    schedulers = [
+      Scheduler.options(num_cpus=0).remote(  # type: ignore[attr-defined]
+        CLASS_WORKERS, batch_size, False, {NODE_CLASS_LABEL: node_class}
+      )
+      for node_class in node_classes
+    ]
+    run_futures = [scheduler.run.remote() for scheduler in schedulers]
+
+    monitors = _await_monitor_count(expected)
+
+    # Each actor must be pinned to a distinct node (one monitor per node).
+    node_ids = {m.node_id for m in monitors}
+    assert len(node_ids) == expected, (
+      f"expected actors on {expected} distinct nodes, saw {len(node_ids)}"
+    )
+
+    # Every monitor must sit on a node of its autoscaler's class; with both
+    # classes at their target this means an exact per-class split.
+    counts = _monitor_class_counts(monitors)
+    assert counts == {node_class: CLASS_WORKERS for node_class in node_classes}, (
+      f"expected {CLASS_WORKERS} monitors per node class, saw {dict(counts)}"
+    )
+
+    # The converged counts must be stable: no drift and no cross-class claims.
+    time.sleep(STABILITY_WINDOW)
+    monitors = _alive_monitors()
+    counts = _monitor_class_counts(monitors)
+    assert counts == {node_class: CLASS_WORKERS for node_class in node_classes}, (
+      f"per-class monitor counts drifted to {dict(counts)} after convergence"
+    )
+
+    ray.get([scheduler.stop.remote() for scheduler in schedulers])
+    # Surface any error from the run loops.
+    ray.get(run_futures)
   finally:
     ray.shutdown()
     cluster.shutdown()  # type: ignore[no-untyped-call]

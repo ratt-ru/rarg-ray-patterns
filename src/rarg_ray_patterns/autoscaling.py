@@ -49,12 +49,42 @@ def discover_node() -> tuple[Any, Any]:
 
 
 class ActorAutoscaler:
+  """Maintain one MonitorActor per node on ``nworkers`` cluster nodes.
+
+  Args:
+    nworkers: Initial target number of monitored nodes; ``autoscale(target=...)``
+      retargets it.
+    batch_size: Maximum number of node discoveries requested per ``autoscale``
+      call.
+    install_on_head: Whether the head node may be monitored. When a
+      ``label_selector`` is given, the head is additionally eligible only if it
+      matches the selector.
+    label_selector: Ray label selector constraining which nodes this autoscaler
+      may manage, e.g. ``{"rarg.io/node-class": "compute"}``. Values use Ray's
+      selector syntax verbatim (``in(a,b)``, ``!x``, ...). The
+      ``ray.io/node-id`` key is reserved for the autoscaler's own node
+      exclusion and pinning. Multiple autoscalers can share a cluster, each
+      managing its own node class; their selectors must be disjoint — each
+      autoscaler excludes only nodes *it* monitors, so overlapping selectors
+      can claim the same node twice.
+  """
+
   def __init__(
-    self, nworkers: int = 10, batch_size: int = 2, install_on_head: bool = False
+    self,
+    nworkers: int = 10,
+    batch_size: int = 2,
+    install_on_head: bool = False,
+    label_selector: dict[str, str] | None = None,
   ):
+    if label_selector and "ray.io/node-id" in label_selector:
+      raise ValueError(
+        "'ray.io/node-id' is reserved for the ActorAutoscaler's node "
+        "exclusion and pinning; constrain node classes with other labels"
+      )
     self._nworkers: int = nworkers
     self._batch_size: int = batch_size
     self._install_on_head: bool = install_on_head
+    self._label_selector: dict[str, str] = dict(label_selector or {})
     # Resolved lazily on first autoscale(); cached because the head node id is
     # stable for the cluster's lifetime. _UNSET until looked up.
     self._head_node_id: Any = _UNSET
@@ -147,9 +177,15 @@ class ActorAutoscaler:
       if (head := self._resolve_head_node_id()) is not None:
         excluded.add(head)
 
-    options: dict[str, Any] = {"num_cpus": 0, "scheduling_strategy": "SPREAD"}
+    # Selector keys AND together: discovery lands only on nodes of the
+    # requested class that aren't already monitored.
+    selector = dict(self._label_selector)
     if excluded:
-      options["label_selector"] = {"ray.io/node-id": f"!in({','.join(excluded)})"}
+      selector["ray.io/node-id"] = f"!in({','.join(excluded)})"
+
+    options: dict[str, Any] = {"num_cpus": 0, "scheduling_strategy": "SPREAD"}
+    if selector:
+      options["label_selector"] = selector
 
     print(f"Requesting {requested} nodes")
     for _ in range(requested):
@@ -200,8 +236,8 @@ class ActorAutoscaler:
         ray.cancel(keepalive_ref, force=True)
         continue
 
-      # Pin a long-lived monitor actor to this node. num_cpus=1 makes it the
-      # node's permanent CPU consumer so the autoscaler keeps the node alive.
+      # Pin a long-lived monitor actor to this node. The autoscaler treats the
+      # pinned actor as demand on this node and keeps the node alive.
       monitor = MonitorActor.options(  # type: ignore[attr-defined]
         num_cpus=0,
         label_selector={"ray.io/node-id": node_id},
