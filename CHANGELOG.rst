@@ -2,7 +2,7 @@
 Changelog
 =========
 
-0.0.2 (unreleased)
+0.0.2 (03-07-2026)
 ------------------
 
 * Support a ``label_selector`` argument in ``ActorAutoscaler`` constraining
