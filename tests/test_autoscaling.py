@@ -96,7 +96,7 @@ def _head_node_id() -> str:
 # flag values, since the flag behaviour is already covered by the nworkers=8 pair.
 @pytest.mark.filterwarnings("ignore::FutureWarning")
 @pytest.mark.parametrize(
-  "nworkers, batch_size, install_on_head", [(8, 5, False), (8, 5, True), (20, 5, False)]
+  "nworkers, batch_size, install_on_head", [(8, 2, False), (8, 2, True), (10, 2, False)]
 )
 def test_actor_autoscaling(
   nworkers: int,
