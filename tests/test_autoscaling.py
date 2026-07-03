@@ -50,15 +50,19 @@ class Scheduler:
     self, nworkers: int = 10, batch_size: int = 2, install_on_head: bool = False
   ):
     self._autoscaler = ActorAutoscaler(nworkers, batch_size, install_on_head)
+    self._target = nworkers
     self._event = asyncio.Event()
 
   async def run(self) -> None:
     try:
       while not self._event.is_set():
         await asyncio.sleep(1.0)
-        await self._autoscaler.autoscale()
+        await self._autoscaler.autoscale(target=self._target)
     finally:
       await self._autoscaler.close()
+
+  async def resize(self, nworkers: int) -> None:
+    self._target = nworkers
 
   async def stop(self) -> None:
     self._event.set()
@@ -75,6 +79,20 @@ def _alive_monitors() -> list[ActorState]:
     detail=True,
   )
   return actors
+
+
+def _await_monitor_count(expected: int) -> list[ActorState]:
+  """Poll until exactly ``expected`` monitors are alive, or the deadline passes."""
+  deadline = time.monotonic() + CONVERGE_TIMEOUT
+  monitors = _alive_monitors()
+  while len(monitors) != expected and time.monotonic() < deadline:
+    time.sleep(POLL_INTERVAL)
+    monitors = _alive_monitors()
+  assert len(monitors) == expected, (
+    f"expected {expected} MonitorActors scheduled, "
+    f"saw {len(monitors)} after {CONVERGE_TIMEOUT}s"
+  )
+  return monitors
 
 
 def _head_node_id() -> str:
@@ -154,6 +172,53 @@ def test_actor_autoscaling(
       f"actor count drifted to {len(monitors)} after convergence"
     )
     assert len(monitors) <= nworkers
+
+    ray.get(scheduler.stop.remote())
+    # Surface any error from the run loop.
+    ray.get(run_future)
+  finally:
+    ray.shutdown()
+    cluster.shutdown()  # type: ignore[no-untyped-call]
+
+
+# One cluster spin-up (they are slow) exercising both directions: converge up,
+# resize down, then resize back up to prove reaped nodes can be re-used. We do
+# not assert that Ray reaps the idled nodes themselves - the fake cluster's
+# idle timeout makes that slow and flaky; the converged actor count is the
+# contract this package owns.
+@pytest.mark.filterwarnings("ignore::FutureWarning")
+def test_actor_downscaling() -> None:
+  nworkers, batch_size = 8, 2
+
+  cfg = typing.cast(dict[str, typing.Any], copy.deepcopy(AUTOSCALING_CLUSTER_CONFIG))
+  cfg["worker_node_types"]["cpu_node"]["max_workers"] = nworkers
+  cfg["max_workers"] = nworkers * 5
+  with pytest.warns(ResourceWarning, match="unclosed file"):
+    cluster = AutoscalingCluster(**cfg)
+
+  try:
+    cluster.start()
+    ray.init("auto", runtime_env={"excludes": ".*"})
+    scheduler = Scheduler.options(num_cpus=0).remote(  # type: ignore[attr-defined]
+      nworkers, batch_size
+    )
+    run_future = scheduler.run.remote()
+
+    for target in (nworkers, 3, 6):
+      ray.get(scheduler.resize.remote(target))
+      monitors = _await_monitor_count(target)
+      node_ids = {m.node_id for m in monitors}
+      assert len(node_ids) == target, (
+        f"expected actors on {target} distinct nodes, saw {len(node_ids)}"
+      )
+
+      # The converged count must be stable: no drift, and in particular no
+      # reprovisioning of intentionally reaped workers.
+      time.sleep(STABILITY_WINDOW)
+      monitors = _alive_monitors()
+      assert len(monitors) == target, (
+        f"actor count drifted to {len(monitors)} after converging on {target}"
+      )
 
     ray.get(scheduler.stop.remote())
     # Surface any error from the run loop.

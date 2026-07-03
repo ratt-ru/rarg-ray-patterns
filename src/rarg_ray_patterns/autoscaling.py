@@ -15,9 +15,15 @@ _UNSET = object()
 
 @ray.remote
 class MonitorActor:
+  def __init__(self) -> None:
+    self._heartbeat = asyncio.Event()
+
   async def heartbeat(self) -> None:
     """Block forever; the awaiter sees RayActorError when the actor dies."""
-    await asyncio.Event().wait()
+    await self._heartbeat.wait()
+
+  async def stop(self) -> None:
+    self._heartbeat.set()
 
 
 @ray.remote
@@ -101,7 +107,12 @@ class ActorAutoscaler:
       )
     return self._head_node_id  # type: ignore[no-any-return]
 
-  async def autoscale(self, timeout: float = 1.0) -> None:
+  async def autoscale(self, timeout: float = 1.0, target: int | None = None) -> None:
+    # A target retargets the autoscaler; None keeps the current one. The
+    # constructor's nworkers is thus only the initial target.
+    if target is not None:
+      self._nworkers = target
+
     # Drain completed discoveries first so capacity decisions reflect them.
     if self._pending:
       ready, _ = await asyncio.wait(
@@ -112,12 +123,15 @@ class ActorAutoscaler:
       self._handle_ready(ready)
 
     # If we hit capacity (e.g. nworkers shrunk, or a burst overshot),
-    # cancel surplus pending work instead of letting it leak extra nodes.
+    # cancel surplus pending work instead of letting it leak extra nodes,
+    # and reap surplus live monitors so their nodes can be released.
     if len(self._workers) >= self._nworkers:
       for node_ref, keepalive_ref in self._pending.values():
         ray.cancel(node_ref, force=True)
         ray.cancel(keepalive_ref, force=True)
       self._pending.clear()
+      if (surplus := len(self._workers) - self._nworkers) > 0:
+        self._reap(surplus)
       print(f"Autoscaler at capacity: {list(self._workers)}")
       return
 
@@ -144,6 +158,20 @@ class ActorAutoscaler:
       node_ref, keepalive_ref = discover_node.options(**options).remote()  # type: ignore[misc]
       future = wrap_future(node_ref)
       self._pending[future] = (node_ref, keepalive_ref)
+
+  def _reap(self, count: int) -> None:
+    head = self._resolve_head_node_id()
+    # Kill worker-node monitors first: their nodes can be released by the Ray
+    # autoscaler, whereas the head node persists regardless, so its monitor
+    # (when install_on_head) is the cheapest one to keep.
+    victims = sorted(self._workers, key=lambda nid: nid == head)[:count]
+    for node_id in victims:
+      # Popping before the kill marks the death as intentional, so
+      # _on_actor_dead won't treat it as a crash. The node id also leaves the
+      # discovery exclusion set, letting the node be re-used if the target
+      # grows again.
+      ray.kill(self._workers.pop(node_id))
+    print(f"Reaped {len(victims)} workers: {victims}")
 
   def _handle_ready(self, ready: set[asyncio.Future[Any]]) -> None:
     new_nodes = []
@@ -189,15 +217,22 @@ class ActorAutoscaler:
       heartbeat = wrap_future(monitor.heartbeat.remote())
       self._heartbeats.add(heartbeat)
       heartbeat.add_done_callback(self._heartbeats.discard)
-      heartbeat.add_done_callback(lambda f, nid=node_id: self._on_actor_dead(nid, f))  # type: ignore[misc]
+      heartbeat.add_done_callback(
+        lambda f, nid=node_id, actor=monitor: self._on_actor_dead(nid, actor, f)  # type: ignore[misc]
+      )
 
     if new_nodes:
       print(f"Procured {len(new_nodes)} nodes: {new_nodes}")
 
-  def _on_actor_dead(self, node_id: str, future: asyncio.Future[Any]) -> None:
+  def _on_actor_dead(
+    self, node_id: str, actor: ray.actor.ActorHandle[Any], future: asyncio.Future[Any]
+  ) -> None:
     # Always retrieve the exception so asyncio doesn't warn about it.
     exc = None if future.cancelled() else future.exception()
     if self._closed:
+      return
+    if self._workers.get(node_id) is not actor:
+      # Reaped by downscaling (or already replaced); not a crash.
       return
     print(f"Worker on {node_id} died ({exc!r}); will reprovision")
     self._workers.pop(node_id, None)
