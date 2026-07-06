@@ -2,6 +2,21 @@
 Changelog
 =========
 
+0.0.3 (unreleased)
+------------------
+
+* Breaking: ``ActorAutoscaler.deployments`` is a method rather than a
+  property. It accepts an ``actor_cls`` argument selecting which of each
+  node's spec actors to return: a single class returns ``{node_id: actor}``,
+  a tuple of classes returns ``{node_id: (actor, ...)}`` in the requested
+  order, and ``None`` (the default) returns every instance in ``actor_specs``
+  order (:pr:`4`).
+* ``ActorAutoscaler`` accepts ``actor_specs``: a sequence of ``ActorSpec``\s
+  describing an actor class, its constructor arguments and its
+  ``.options(...)`` overrides. One instance of each spec is installed on
+  every managed node alongside its ``MonitorActor``, pinned to the node and
+  reaped with it (:pr:`4`).
+
 0.0.2 (03-07-2026)
 ------------------
 
