@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/setup-python@v6
         with: { python-version: '3.13' }
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - run: pip install -U pip build && python -m build --sdist --wheel
       - name: Publish distribution 📦 to PyPI
         if: github.event_name == 'push' && startsWith(github.event.ref, 'refs/tags')
