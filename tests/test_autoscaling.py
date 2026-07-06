@@ -10,7 +10,12 @@ from ray.cluster_utils import AutoscalingCluster
 from ray.util.state import list_actors, list_nodes
 from ray.util.state.common import ActorState, NodeState
 
-from rarg_ray_patterns.autoscaling import ActorAutoscaler
+from rarg_ray_patterns.autoscaling import (
+  ActorAutoscaler,
+  ActorSpec,
+  _class_key,
+  _NodeDeployment,
+)
 
 # Maximum number of cpu_node workers the cluster will provision. The autoscaler
 # pins one MonitorActor per node, so this also caps how many actors can be
@@ -46,6 +51,27 @@ AUTOSCALING_CLUSTER_CONFIG = {
 
 
 @ray.remote
+class EchoActor:
+  """Test actor capturing its constructor arguments."""
+
+  def __init__(self, value: str, repeat: int = 1) -> None:
+    self._value = value * repeat
+
+  async def value(self) -> str:
+    return self._value
+
+
+class PlainCounter:
+  """Plain (undecorated) test class; ActorSpec wraps it with ray.remote."""
+
+  def __init__(self, start: int = 0) -> None:
+    self._start = start
+
+  def start(self) -> int:
+    return self._start
+
+
+@ray.remote
 class Scheduler:
   def __init__(
     self,
@@ -53,12 +79,18 @@ class Scheduler:
     batch_size: int = 2,
     install_on_head: bool = False,
     label_selector: dict[str, str] | None = None,
+    actor_specs: tuple[ActorSpec, ...] = (),
   ):
     self._autoscaler = ActorAutoscaler(
-      nworkers, batch_size, install_on_head, label_selector
+      nworkers, batch_size, install_on_head, label_selector, actor_specs
     )
     self._target = nworkers
     self._event = asyncio.Event()
+
+  async def deployments(
+    self, actor_cls: type | tuple[type, ...] | None = None
+  ) -> dict[str, typing.Any]:
+    return self._autoscaler.deployments(actor_cls)
 
   async def run(self) -> None:
     try:
@@ -75,12 +107,12 @@ class Scheduler:
     self._event.set()
 
 
-def _alive_monitors() -> list[ActorState]:
-  """Return the live MonitorActor entries currently scheduled on the cluster."""
+def _alive_actors(class_name: str = "MonitorActor") -> list[ActorState]:
+  """Return the live ``class_name`` actors currently scheduled on the cluster."""
   # list_actors is typed as returning Any; pin the element type here.
   actors: list[ActorState] = list_actors(
     filters=[
-      ("class_name", "=", "MonitorActor"),
+      ("class_name", "=", class_name),
       ("state", "=", "ALIVE"),
     ],
     detail=True,
@@ -88,18 +120,20 @@ def _alive_monitors() -> list[ActorState]:
   return actors
 
 
-def _await_monitor_count(expected: int) -> list[ActorState]:
-  """Poll until exactly ``expected`` monitors are alive, or the deadline passes."""
+def _await_actor_count(
+  expected: int, class_name: str = "MonitorActor"
+) -> list[ActorState]:
+  """Poll until exactly ``expected`` actors are alive, or the deadline passes."""
   deadline = time.monotonic() + CONVERGE_TIMEOUT
-  monitors = _alive_monitors()
-  while len(monitors) != expected and time.monotonic() < deadline:
+  actors = _alive_actors(class_name)
+  while len(actors) != expected and time.monotonic() < deadline:
     time.sleep(POLL_INTERVAL)
-    monitors = _alive_monitors()
-  assert len(monitors) == expected, (
-    f"expected {expected} MonitorActors scheduled, "
-    f"saw {len(monitors)} after {CONVERGE_TIMEOUT}s"
+    actors = _alive_actors(class_name)
+  assert len(actors) == expected, (
+    f"expected {expected} {class_name}s scheduled, "
+    f"saw {len(actors)} after {CONVERGE_TIMEOUT}s"
   )
-  return monitors
+  return actors
 
 
 def _head_node_id() -> str:
@@ -148,10 +182,10 @@ def test_actor_autoscaling(
     # Poll until the cluster has scheduled the expected number of monitor
     # actors, rather than waiting a fixed (and flaky) duration.
     deadline = time.monotonic() + CONVERGE_TIMEOUT
-    monitors = _alive_monitors()
+    monitors = _alive_actors()
     while len(monitors) < expected and time.monotonic() < deadline:
       time.sleep(POLL_INTERVAL)
-      monitors = _alive_monitors()
+      monitors = _alive_actors()
 
     assert len(monitors) == expected, (
       f"expected {expected} MonitorActors scheduled, "
@@ -174,7 +208,7 @@ def test_actor_autoscaling(
     # The converged count must be stable and must never overshoot the
     # requested worker count.
     time.sleep(STABILITY_WINDOW)
-    monitors = _alive_monitors()
+    monitors = _alive_actors()
     assert len(monitors) == expected, (
       f"actor count drifted to {len(monitors)} after convergence"
     )
@@ -192,6 +226,58 @@ def test_label_selector_reserved_key() -> None:
   """The node-id label is reserved for the autoscaler's exclusion/pinning."""
   with pytest.raises(ValueError, match="ray.io/node-id"):
     ActorAutoscaler(label_selector={"ray.io/node-id": "some-node-id"})
+
+
+def test_actor_spec_normalises_actor_class() -> None:
+  """A plain class is wrapped with ray.remote; non-classes are rejected."""
+  spec = ActorSpec(PlainCounter)
+  assert isinstance(spec.actor_class, ray.actor.ActorClass)
+  # An already-decorated class passes through untouched.
+  assert ActorSpec(EchoActor).actor_class is EchoActor
+  with pytest.raises(TypeError, match="actor_class"):
+    ActorSpec(42)
+
+
+def test_actor_spec_reserved_key() -> None:
+  """The node-id label is reserved for the autoscaler's node pinning."""
+  with pytest.raises(ValueError, match="ray.io/node-id"):
+    ActorSpec(PlainCounter, options={"label_selector": {"ray.io/node-id": "a-node"}})
+
+
+def test_deployments_actor_cls_selection() -> None:
+  """deployments() selects each node's handles by class, in the requested shape."""
+  specs = (ActorSpec(EchoActor, args=("a",)), ActorSpec(PlainCounter))
+  autoscaler = ActorAutoscaler(actor_specs=specs)
+  # Fake handles: deployments() only indexes them, so sentinels suffice.
+  monitor, echo, counter = (typing.cast(typing.Any, object()) for _ in range(3))
+  autoscaler._deployments["node-1"] = _NodeDeployment(monitor, (echo, counter))
+
+  # None returns every instance, in actor_specs order.
+  assert autoscaler.deployments() == {"node-1": (echo, counter)}
+  # A singleton class returns a bare handle; decorated (EchoActor) and plain
+  # (PlainCounter) classes both resolve to their spec.
+  assert autoscaler.deployments(typing.cast(type, EchoActor)) == {"node-1": echo}
+  assert autoscaler.deployments(PlainCounter) == {"node-1": counter}
+  # A tuple of classes returns handles in the requested order, not spec order.
+  assert autoscaler.deployments((PlainCounter, typing.cast(type, EchoActor))) == {
+    "node-1": (counter, echo)
+  }
+
+
+def test_deployments_actor_cls_errors() -> None:
+  """Unknown and ambiguous classes are rejected."""
+  specs = (ActorSpec(PlainCounter), ActorSpec(PlainCounter))
+  autoscaler = ActorAutoscaler(actor_specs=specs)
+
+  class Unknown:
+    pass
+
+  with pytest.raises(ValueError, match="matches 0 actor specs"):
+    autoscaler.deployments(Unknown)
+  with pytest.raises(ValueError, match="matches 2 actor specs"):
+    autoscaler.deployments(PlainCounter)
+  # actor_cls=None remains available when duplicate specs make a class ambiguous.
+  assert autoscaler.deployments() == {}
 
 
 # The label key constraining which node class an autoscaler manages, and how
@@ -265,7 +351,7 @@ def test_actor_autoscaling_label_selectors() -> None:
     ]
     run_futures = [scheduler.run.remote() for scheduler in schedulers]
 
-    monitors = _await_monitor_count(expected)
+    monitors = _await_actor_count(expected)
 
     # Each actor must be pinned to a distinct node (one monitor per node).
     node_ids = {m.node_id for m in monitors}
@@ -282,7 +368,7 @@ def test_actor_autoscaling_label_selectors() -> None:
 
     # The converged counts must be stable: no drift and no cross-class claims.
     time.sleep(STABILITY_WINDOW)
-    monitors = _alive_monitors()
+    monitors = _alive_actors()
     counts = _monitor_class_counts(monitors)
     assert counts == {node_class: CLASS_WORKERS for node_class in node_classes}, (
       f"per-class monitor counts drifted to {dict(counts)} after convergence"
@@ -321,7 +407,7 @@ def test_actor_downscaling() -> None:
 
     for target in (nworkers, 3, 6):
       ray.get(scheduler.resize.remote(target))
-      monitors = _await_monitor_count(target)
+      monitors = _await_actor_count(target)
       node_ids = {m.node_id for m in monitors}
       assert len(node_ids) == target, (
         f"expected actors on {target} distinct nodes, saw {len(node_ids)}"
@@ -330,10 +416,108 @@ def test_actor_downscaling() -> None:
       # The converged count must be stable: no drift, and in particular no
       # reprovisioning of intentionally reaped workers.
       time.sleep(STABILITY_WINDOW)
-      monitors = _alive_monitors()
+      monitors = _alive_actors()
       assert len(monitors) == target, (
         f"actor count drifted to {len(monitors)} after converging on {target}"
       )
+
+    ray.get(scheduler.stop.remote())
+    # Surface any error from the run loop.
+    ray.get(run_future)
+  finally:
+    ray.shutdown()
+    cluster.shutdown()  # type: ignore[no-untyped-call]
+
+
+# One cluster spin-up proving spec actors are installed alongside the monitor:
+# each managed node carries one instance of each spec with its constructor
+# arguments intact, and downscaling reaps the whole per-node set.
+@pytest.mark.filterwarnings("ignore::FutureWarning")
+def test_actor_spec_installation() -> None:
+  # The spec classes are defined inside the test so cloudpickle serializes
+  # them by value: the test module itself is not importable on cluster
+  # workers, so a by-reference pickle of a module-level class would fail to
+  # deserialize inside the Scheduler actor.
+  @ray.remote
+  class SpecEcho:
+    def __init__(self, value: str, repeat: int = 1) -> None:
+      self._value = value * repeat
+
+    async def value(self) -> str:
+      return self._value
+
+  class SpecCounter:
+    """Plain (undecorated) class; ActorSpec wraps it with ray.remote."""
+
+    def __init__(self, start: int = 0) -> None:
+      self._start = start
+
+    def start(self) -> int:
+      return self._start
+
+  nworkers, batch_size = 3, 2
+  # The state API reports an actor's class by qualname; for these nested
+  # classes that is "test_actor_spec_installation.<locals>.Spec...".
+  spec_classes = (_class_key(SpecEcho)[1], _class_key(SpecCounter)[1])
+  specs = (
+    # Also exercises options merging: num_cpus=0 rides along with the pin.
+    ActorSpec(SpecEcho, args=("ping",), kwargs={"repeat": 2}, options={"num_cpus": 0}),
+    # A plain class with Ray's default resource request (1 CPU).
+    ActorSpec(SpecCounter, args=(7,)),
+  )
+
+  cfg = typing.cast(dict[str, typing.Any], copy.deepcopy(AUTOSCALING_CLUSTER_CONFIG))
+  cfg["worker_node_types"]["cpu_node"]["max_workers"] = nworkers
+  cfg["max_workers"] = nworkers * 5
+  with pytest.warns(ResourceWarning, match="unclosed file"):
+    cluster = AutoscalingCluster(**cfg)
+
+  try:
+    cluster.start()
+    ray.init("auto", runtime_env={"excludes": ".*"})
+    scheduler = Scheduler.options(num_cpus=0).remote(  # type: ignore[attr-defined]
+      nworkers, batch_size, False, None, specs
+    )
+    run_future = scheduler.run.remote()
+
+    monitors = _await_actor_count(nworkers)
+    monitor_nodes = {m.node_id for m in monitors}
+
+    # One instance of each spec class per monitored node.
+    for class_name in spec_classes:
+      actors = _await_actor_count(nworkers, class_name)
+      assert {a.node_id for a in actors} == monitor_nodes, (
+        f"{class_name}s not colocated with the monitors"
+      )
+
+    # Constructor arguments reached the installed actors, whose handles are
+    # exposed per node in spec order.
+    deployments = ray.get(scheduler.deployments.remote())
+    assert set(deployments) == monitor_nodes
+    for echo, counter in deployments.values():
+      assert ray.get(echo.value.remote()) == "pingping"
+      assert ray.get(counter.start.remote()) == 7
+
+    # A singleton actor_cls selects one bare handle per node. The class
+    # crosses the process boundary by value (a second pickle of SpecEcho), so
+    # this also proves matching survives serialization.
+    echoes = ray.get(scheduler.deployments.remote(SpecEcho))
+    assert set(echoes) == monitor_nodes
+    for echo in echoes.values():
+      assert ray.get(echo.value.remote()) == "pingping"
+
+    # A tuple of classes returns handles in the requested order, not spec order.
+    reordered = ray.get(scheduler.deployments.remote((SpecCounter, SpecEcho)))
+    assert set(reordered) == monitor_nodes
+    for counter, echo in reordered.values():
+      assert ray.get(counter.start.remote()) == 7
+      assert ray.get(echo.value.remote()) == "pingping"
+
+    # Downscaling reaps each node's whole actor set.
+    target = 1
+    ray.get(scheduler.resize.remote(target))
+    for class_name in ("MonitorActor", *spec_classes):
+      _await_actor_count(target, class_name)
 
     ray.get(scheduler.stop.remote())
     # Surface any error from the run loop.
