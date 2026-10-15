@@ -19,9 +19,7 @@ Homepage = "https://github.com/ratt-ru/rarg-ray-patterns"
 Repository = "https://github.com/ratt-ru/rarg-ray-patterns"
 
 [dependency-groups]
-# ray[default] pulls in the dashboard / state-API server that the tests use to
-# query scheduled actors via ray.util.state.
-test = ["pytest", "ray[default]"]
+test = ["pytest"]
 dev = ["pre-commit", "mypy", "ruff", "tbump"]
 
 [tool.hatch.build.targets.wheel]
