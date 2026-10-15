@@ -5,7 +5,7 @@ Changelog
 0.0.3 (15-10-2026)
 ------------------
 
-* Remove ``ActorAutoscaler`` and the ``rarg_ray_patterns.utils`` module.
+* Remove ``ActorAutoscaler`` and the ``rarg_ray_patterns.utils`` module (:pr:`6`).
 
 0.0.2 (03-07-2026)
 ------------------
